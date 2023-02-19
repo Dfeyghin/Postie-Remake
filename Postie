@@ -1,0 +1,181 @@
+--[[
+	A fork of Postie 1.1.0 by BenSBk
+    
+    v. 1.0.0 - Reverence
+
+	Depends on:
+	- The Roblox API
+	- A RemoteEvent named Sent
+	- A RemoteEvent named Received
+	- A RemoteEvent named ClientToServerPostie
+	- A BindableEvent named DDosToPostie
+	- AntiDDOS server script
+	
+	Postie is a safe alternative to RemoteFunctions with a time-out.
+
+    Changelog v. 1.0.0:
+    1. Added a default timeout of 5 seconds , in case a timeout was not passed
+    2. removed code duplication
+    3. renamed the calls to fit our code style better
+    4. Hooked up the client to server posties with the antiDDOS system
+-----------------------------------------------------------------------------------------	
+	Postie:InvokeClient( // yields, server-side
+		player: Player,
+		id: string,
+		timeOut: number,
+		...data: any
+	) => didRespond: boolean, ...response: any
+	
+		Invoke player with sent data. Invocation identified by id. Yield until
+		timeOut (given in seconds) is reached and return false, or a response is
+		received back from the client and return true plus the data returned
+		from the client. If the invocation reaches the client, but the client
+		doesn't have a corresponding callback, return before timeOut regardless
+		but return false.
+	
+	Postie:InvokeServer( // yields, client-side
+		id: string,
+		timeOut: number,
+		...data: any
+	) => didRespond: boolean, ...response: any
+	
+		Invoke the server with sent data. Invocation identified by id. Yield
+		until timeOut (given in seconds) is reached and return false, or a
+		response is received back from the server and return true plus the data
+		returned from the server. If the invocation reaches the server, but the
+		server doesn't have a corresponding callback, return before timeOut
+		regardless but return false.
+	
+	Postie:OnInvoke(
+		id: string,
+		callback?: (...data: any) -> ...response: any
+	)
+	
+		Set the callback that is invoked when an invocation identified by id is
+		sent. Data sent with the invocation are passed to the callback. If on
+		the server, the player who invoked is implicitly received as the first
+		argument.
+	
+	Postie:GetCallback(
+		id: string
+	) => callback?: (...data: any) -> ...response: any
+	
+		Return the callback corresponding with id.
+]]
+
+local HttpService = game:GetService("HttpService")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local sent = script:WaitForChild("Sent")
+local received = script:WaitForChild("Received")
+
+local DDosToPostie = script:WaitForChild("DDosToPostie")
+
+local isServer = RunService:IsServer()
+local callbackById = {}
+local listenerByUuid = {}
+
+local DEFAULT_TIMEOUT = 10
+
+local Postie = {}
+
+local function SetupListenerWithTimeout(serverInvoked: boolean, uuid: string, player: Player, id: string, timeOut: number, ...: any)
+	local thread = coroutine.running()
+	local isResumed = false
+	 -- generate a universally unique identifer with false as argument - to not wrap in curly braces.
+
+	-- Create the listener function to execute upon response from client:
+	listenerByUuid[uuid] =  function(respondingPlayer, didInvokeCallback, ...)
+		-- check that the responding client is the correct one and exists
+		if serverInvoked and (respondingPlayer == nil or respondingPlayer ~= player) then return end 
+			isResumed = true -- resume the thread (stop the task.delay timout)
+			listenerByUuid[uuid] = nil -- clean the listener from the table
+			if didInvokeCallback then -- if the player responded to the invoke:
+				task.spawn(thread, true, ...)
+			else
+				task.spawn(thread, false)
+			end
+		end
+
+	if not timeOut then timeOut = DEFAULT_TIMEOUT end
+	-- Create timeout behavior:
+	task.delay(timeOut, function()
+		if isResumed then
+			return
+		end
+		-- if timeout is done before the player responded, clean the listener and return false
+		listenerByUuid[uuid] = nil
+		task.spawn(thread, false)
+	end)
+end
+
+function Postie:InvokeClient(player: Player, id: string, timeOut: number, ...: any): (boolean, ...any)
+	assert(isServer, "Postie.InvokeClient can only be called from the server")
+	local uuid = HttpService:GenerateGUID(false)
+	local serverIsInvoking = true
+	SetupListenerWithTimeout(serverIsInvoking,uuid, player, id, timeOut, ...)
+
+	-- Finally, we send the signal to the client and await either the client's response or the time-out.
+	sent:FireClient(player, id, uuid, ...)
+	return coroutine.yield()
+end
+
+function Postie:InvokeServer(scriptName: string, id: string, timeOut: number, ...: any): (boolean, ...any)
+	assert(not isServer, "Postie.InvokeServer can only be called from the client")
+	
+	local uuid = HttpService:GenerateGUID(false)
+	local serverIsInvoking = false
+	SetupListenerWithTimeout(serverIsInvoking,uuid, nil, id, timeOut, ...)
+	
+	-- Finally, we send the signal to the client and await either the client's response or the time-out.
+	script.ClientToServerPostie:FireServer(scriptName, id, uuid, ...)
+	--sent:FireServer(id, uuid, ...)
+	return coroutine.yield()
+end
+
+function Postie:OnInvoke(id: string, callback: ((...any) -> ...any)?)
+	callbackById[id] = callback
+end
+
+function Postie:GetCallback(id: string): ((...any) -> ...any)?
+	return callbackById[id]
+end
+
+if isServer then
+	-- We handle responses received from the client.
+	received.OnServerEvent:Connect(function(player, uuid, didInvokeCallback, ...)
+		local listener = listenerByUuid[uuid]
+		if listener then listener(player, didInvokeCallback, ...) end
+	end)
+
+	-- We handle requests sent by the client.
+	--sent.OnServerEvent:Connect(function(player, id, uuid, ...)
+	DDosToPostie.Event:Connect(function(player, id, uuid, ...)
+		
+		local callback = callbackById[id]
+		if callback then
+			received:FireClient(player, uuid, true, callback(player, ...))
+		else
+			received:FireClient(player, uuid, false)
+		end
+	end)
+else
+	-- We handle responses received from the server.
+	received.OnClientEvent:Connect(function(uuid, didInvokeCallback, ...)
+		local listener = listenerByUuid[uuid]
+		if listener then listener(nil, didInvokeCallback, ...) end
+	end)
+
+	-- We handle requests sent by the server.
+	sent.OnClientEvent:Connect(function(id, uuid, ...)
+		local callback = callbackById[id]
+		if callback then
+			received:FireServer(uuid, true, callback(...))
+		else
+			received:FireServer(uuid, false)
+		end
+	end)
+end
+
+return Postie
